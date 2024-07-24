@@ -1,6 +1,9 @@
-use std::io::{BufRead, BufReader};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::thread;
+use crate::user::User;
+
+const VALIDATE_BUFFER_SIZE: usize = 128;
 
 pub fn start(port: u16) -> std::io::Result<()> {
     let listener = {
@@ -14,8 +17,15 @@ pub fn start(port: u16) -> std::io::Result<()> {
     thread::scope(|scope| {
         for stream_res in listener.incoming() {
             match stream_res {
-                Ok(stream) => {
-                    scope.spawn(move || { handle_connection(stream); });
+                Ok(mut stream) => {
+                    scope.spawn(move || {
+                        match validate_user(&mut stream) {
+                            Ok(user) => {
+                                handle_connection(stream, user);
+                            }
+                            Err(e) => { eprintln!("Failed validating user: {e:?}"); }
+                        };
+                    });
                 }
                 Err(e) => { eprintln!("Failed on handling incoming TcpStream: {e:?}"); }
             }
@@ -25,7 +35,15 @@ pub fn start(port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream) {
+fn validate_user<R: Read>(stream: &mut R) -> std::io::Result<User> {
+    let mut buf = [0; VALIDATE_BUFFER_SIZE];
+    let n = stream.read(&mut buf)?;
+
+    // Don't try to read the null bytes in the buffer
+    Ok(serde_json::from_slice(&buf[..n])?)
+}
+
+fn handle_connection<R: Read>(stream: R, user: User) {
     let mut buffer = Vec::with_capacity(4096);
     let mut stream = BufReader::with_capacity(4096, stream);
     let mut last_pos = 0;
@@ -39,10 +57,12 @@ fn handle_connection(stream: TcpStream) {
                     break;
                 }
 
-                // Minus one to strip the newline
-                let s = String::from_utf8_lossy(&buffer[last_pos..last_pos + n - 1]);
-                eprintln!("{thread_id}Read {n} bytes; as a string: {s:?}");
+                let s = String::from_utf8_lossy(&buffer[last_pos..last_pos + n])
+                    .trim_end()
+                    .to_string();
                 last_pos += n;
+
+                eprintln!("{thread_id}<{}> {s:?}", user.name);
             }
             Err(e) => {
                 eprintln!("{thread_id}Error reading from TcpStream: {e:?}");
@@ -50,6 +70,30 @@ fn handle_connection(stream: TcpStream) {
             }
         }
     }
+}
 
-    eprintln!("{thread_id}Full buffer: {buffer:?}");
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use super::*;
+
+    #[test]
+    fn validate_user_valid_json() {
+        let user = User::new("hello");
+        let user_json = serde_json::to_string(&user).unwrap();
+
+        assert_eq!(user, validate_user(&mut Cursor::new(user_json)).unwrap());
+    }
+
+    // Only necessary because of VALIDATE_BUFFER_SIZE
+    #[test]
+    fn validate_user_buffer_length_failure() {
+        let mut long_str = String::with_capacity(VALIDATE_BUFFER_SIZE);
+        (0..VALIDATE_BUFFER_SIZE).for_each(|_| long_str.push('a'));
+        let user = User::new(long_str);
+        let user_json = serde_json::to_string(&user).unwrap();
+
+        assert!(validate_user(&mut Cursor::new(user_json)).is_err());
+    }
 }

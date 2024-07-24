@@ -38,4 +38,6 @@ pub struct Args {
     pub mode: Mode,
     #[arg(short, long, help = "Port to use. Default will bind any available port", default_value_t = 0)]
     pub port: u16,
+    #[arg(short, long, help = "Username to use for the client. Will prompt if not given.")]
+    pub name: Option<String>,
 }
