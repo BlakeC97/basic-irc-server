@@ -1,6 +1,7 @@
-use std::io::{BufRead, stdin, stdout, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{BufRead, Read, stdin, stdout, Write};
 use thiserror::Error;
+use crate::response::AuthResponse;
+use crate::server::VALIDATE_BUFFER_SIZE;
 use crate::server_friendly_string::ServerFriendlyString;
 use crate::user::User;
 
@@ -10,6 +11,70 @@ pub enum ClientError {
     IO(#[from] std::io::Error),
     #[error("Failed serializing user info: `{0}`")]
     Serde(#[from] serde_json::Error),
+    #[error("Authorization failed: `{0}`")]
+    Auth(#[from] AuthResponse),
+}
+
+#[derive(Debug)]
+pub struct Client<S: Read + Write> {
+    user: User,
+    conn: S,
+}
+
+impl<S: Read + Write> Client<S>
+{
+    pub fn new(user: User, conn: S) -> Self {
+        Self {
+            user,
+            conn,
+        }
+    }
+
+    /// Performs the authorization flow for a connecting user. In addition to the `Result`, this function
+    /// reads an `AuthResponse` from the server indicating success or failure.
+    fn do_auth_flow(&mut self) -> Result<(), ClientError> {
+        let user_str = serde_json::to_vec(&self.user)?;
+        self.conn.write_all(&user_str)?;
+
+        let mut buf = [0; VALIDATE_BUFFER_SIZE * 2];
+        let n = self.conn.read(&mut buf)?;
+        // Don't read the null bytes
+        let resp: AuthResponse = serde_json::from_slice(&buf[..n])?;
+
+        match &resp {
+            AuthResponse::Success => Ok(()),
+            AuthResponse::Error(_) => Err(ClientError::Auth(resp)),
+        }
+    }
+
+    pub fn start(&mut self) -> Result<(), ClientError> {
+        self.do_auth_flow()?;
+
+        loop {
+            let msg = match get_input(b"> ", stdin().lock(), stdout().lock()) {
+                Ok(m) => {
+                    if m.is_empty() {
+                        break;
+                    }
+
+                    ServerFriendlyString::from(m)
+                }
+                Err(e) => {
+                    eprintln!("Couldn't get input, skipping: {e:?}");
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.conn.write_all(msg.0.as_bytes()) {
+                eprintln!("Couldn't write message; skipping: {e:?}");
+                continue;
+            }
+
+            println!("<{}> {}", self.user.name, msg);
+        }
+
+        Ok(())
+    }
 }
 
 /// Reads input using a given prompt up to the first newline.
@@ -27,42 +92,10 @@ where
     Ok(read)
 }
 
-pub fn start(user: User, address: SocketAddr) -> Result<(), ClientError> {
-    let mut client = TcpStream::connect(address)?;
-
-    let user_str = serde_json::to_vec(&user)?;
-    client.write_all(&user_str)?;
-
-    loop {
-        let msg = match get_input(b"> ", stdin().lock(), stdout().lock()) {
-            Ok(m) => {
-                if m.is_empty() {
-                    break;
-                }
-
-                ServerFriendlyString::from(m)
-            }
-            Err(e) => {
-                eprintln!("Couldn't get input, skipping: {e:?}");
-                continue;
-            }
-        };
-
-        if let Err(e) = client.write_all(msg.0.as_bytes()) {
-            eprintln!("Couldn't write message; skipping: {e:?}");
-            continue;
-        }
-
-        println!("<{}> {}", user.name, msg);
-    }
-
-    Ok(())
-}
-
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Seek, SeekFrom};
     use super::*;
 
     #[test]
@@ -89,5 +122,35 @@ mod tests {
         assert_eq!(input_str.len(), input.position() as usize);
         assert_eq!("", &input.get_ref()[input.position() as usize..]);
         assert_eq!(b"> ", &output[..]);
+    }
+
+    #[test]
+    fn test_client_do_auth_flow_success() {
+        let user = User::new(String::from("hello"));
+        let user_json = serde_json::to_vec(&user).unwrap();
+
+        // Set a response where it _would_ be before the client does any writes
+        let mut cursor: Cursor<Vec<u8>> = Default::default();
+        cursor.seek(SeekFrom::Start(user_json.len() as u64)).unwrap();
+        let _ = cursor.write(&serde_json::to_vec(&AuthResponse::Success).unwrap()).unwrap();
+        cursor.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut client = Client::new(user, cursor);
+        assert!(client.do_auth_flow().is_ok());
+    }
+
+    #[test]
+    fn test_client_do_auth_flow_failure() {
+        let user = User::new(String::from("hello"));
+        let user_json = serde_json::to_vec(&user).unwrap();
+
+        // Set a response where it _would_ be before the client does any writes
+        let mut cursor: Cursor<Vec<u8>> = Default::default();
+        cursor.seek(SeekFrom::Start(user_json.len() as u64)).unwrap();
+        let _ = cursor.write(&serde_json::to_vec(&AuthResponse::Error("".to_string())).unwrap()).unwrap();
+        cursor.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut client = Client::new(user, cursor);
+        assert!(client.do_auth_flow().is_err());
     }
 }
