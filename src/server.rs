@@ -1,33 +1,20 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread;
 use parking_lot::Mutex;
 use thiserror::Error;
 use crate::response::AuthResponse;
+use crate::scuffed_clone::ScuffedClone;
 use crate::user::User;
 
-pub const VALIDATE_BUFFER_SIZE: usize = 128;
+pub const VALIDATE_BUFFER_SIZE: usize = 256;
+const CHANNEL_SIZE: usize = 128;
 type SharedMap<K, V> = Arc<Mutex<BTreeMap<K, V>>>;
-
-// So I can use TcpStream for real, but an std::io::Cursor in testing
-trait ScuffedClone {
-    fn scuffed_clone(&self) -> Self;
-}
-
-impl ScuffedClone for TcpStream {
-    fn scuffed_clone(&self) -> Self {
-        self.try_clone().expect("Scuffed clone on a TcpStream didn't work, lolrip")
-    }
-}
-
-impl<T: Clone> ScuffedClone for Cursor<T> {
-    fn scuffed_clone(&self) -> Self {
-        self.clone()
-    }
-}
+type ChatLine = (User, String);
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -41,14 +28,21 @@ pub enum ServerError {
 
 pub fn start(address: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(address)?;
-    let connected_users : SharedMap<User, TcpStream> = Default::default();
+    eprintln!("Listening on port {}", listener.local_addr().expect("Can't get local_addr for server").port());
+
+    let connected_users: SharedMap<User, TcpStream> = Default::default();
+    let (sender, receiver) = mpsc::sync_channel::<ChatLine>(CHANNEL_SIZE);
 
     thread::scope(|scope| {
+        let users = connected_users.clone();
+        scope.spawn(move || { broadcast_messages(users, receiver); });
+
         for stream_res in listener.incoming() {
             match stream_res {
                 Ok(stream) => {
                     let users = connected_users.clone();
-                    scope.spawn(move || handle_connection(stream, users));
+                    let tx = sender.clone();
+                    scope.spawn(move || handle_connection(stream, users, tx));
                 }
                 Err(e) => { eprintln!("Failed on handling incoming stream: {e:?}"); }
             }
@@ -58,10 +52,14 @@ pub fn start(address: SocketAddr) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_connection<S: Read + Write + ScuffedClone>(mut stream: S, mut connected_users: SharedMap<User, S>) {
+fn handle_connection<S: Read + Write + ScuffedClone>(
+    mut stream: S,
+    mut connected_users: SharedMap<User, S>,
+    sender: SyncSender<ChatLine>,
+) {
     match do_auth_flow(&mut stream, &mut connected_users) {
         Ok(user) => {
-            handle_chat(stream, &user);
+            handle_chat(stream, &user, sender);
             connected_users.lock().remove(&user);
         }
         Err(e) => {
@@ -72,7 +70,10 @@ fn handle_connection<S: Read + Write + ScuffedClone>(mut stream: S, mut connecte
 
 /// Performs the authorization flow for a connecting user. In addition to the `Result`, this function
 /// writes an `AuthResponse` to the stream indicating success or failure.
-fn do_auth_flow<S: Read + Write + ScuffedClone>(stream: &mut S, connected_users: &mut SharedMap<User, S>) -> Result<User, ServerError> {
+fn do_auth_flow<S>(stream: &mut S, connected_users: &mut SharedMap<User, S>) -> Result<User, ServerError>
+where
+    S: Read + Write + ScuffedClone
+{
     let mut buf = [0; VALIDATE_BUFFER_SIZE];
     let n = stream.read(&mut buf)?;
 
@@ -94,7 +95,7 @@ fn do_auth_flow<S: Read + Write + ScuffedClone>(stream: &mut S, connected_users:
     Ok(user)
 }
 
-fn handle_chat<R: Read>(stream: R, user: &User) {
+fn handle_chat<R: Read>(stream: R, user: &User, sender: SyncSender<ChatLine>) {
     let mut buffer = Vec::with_capacity(4096);
     let mut stream = BufReader::with_capacity(4096, stream);
     let mut last_pos = 0;
@@ -113,6 +114,10 @@ fn handle_chat<R: Read>(stream: R, user: &User) {
                     .to_string();
                 last_pos += n;
 
+                if let Err(e) = sender.send((user.clone(), s.clone())) {
+                    eprintln!("{thread_id} Error sending message: {e:?}");
+                }
+
                 eprintln!("{thread_id}<{}> {s:?}", user.name);
             }
             Err(e) => {
@@ -120,6 +125,25 @@ fn handle_chat<R: Read>(stream: R, user: &User) {
                 break;
             }
         }
+    }
+}
+
+fn broadcast_messages<S>(users: SharedMap<User, S>, receiver: Receiver<ChatLine>)
+where
+    S: Read + Write + ScuffedClone
+{
+    for (user, msg) in receiver {
+        let full_msg = format!("<{user}> {msg}").into_bytes();
+
+        users
+            .lock()
+            .iter_mut()
+            .filter(|(u, _)| *u != &user)
+            .for_each(|(u, conn)| {
+                if let Err(e) = conn.write_all(&full_msg) {
+                    eprintln!("[BROADCAST] Failed sending message to {u}: {e:?}");
+                }
+            });
     }
 }
 
@@ -193,5 +217,27 @@ mod tests {
             std::mem::discriminant(&ServerError::AlreadyConnected("".to_string()))
         );
         assert_eq!(&expected_cursor, cursor.get_ref());
+    }
+
+    #[test]
+    fn broadcast_message() {
+        let user_1 = User::new("one");
+        let user_2 = User::new("two");
+
+        let connected_users: SharedMap<User, _> = Default::default();
+        connected_users.lock().insert(user_1.clone(), Cursor::new(Vec::<u8>::new()));
+        connected_users.lock().insert(user_2.clone(), Cursor::new(Vec::<u8>::new()));
+
+        let (tx, rx) = mpsc::sync_channel::<ChatLine>(CHANNEL_SIZE);
+        tx.send((user_1.clone(), "hello".to_string())).unwrap();
+        tx.send((user_2.clone(), "yo waddup".to_string())).unwrap();
+        drop(tx);
+
+        broadcast_messages(connected_users.clone(), rx);
+        {
+            let users = connected_users.lock();
+            assert_eq!(Cursor::new(Vec::from(b"<two> yo waddup")).get_ref(), users.get(&user_1).unwrap().get_ref());
+            assert_eq!(Cursor::new(Vec::from(b"<one> hello")).get_ref(), users.get(&user_2).unwrap().get_ref());
+        }
     }
 }

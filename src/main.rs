@@ -1,5 +1,5 @@
 use std::io::{stdin, stdout};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use anyhow::Result;
 use clap::Parser;
 use crate::args::{Args, Mode};
@@ -12,6 +12,7 @@ mod client;
 mod user;
 mod server_friendly_string;
 mod response;
+mod scuffed_clone;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -19,8 +20,6 @@ fn main() -> Result<()> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), args.port);
     match args.mode {
         Mode::Server => {
-            let listener = TcpListener::bind(addr)?;
-            eprintln!("Listening on port {}", listener.local_addr().expect("Can't get local_addr for server").port());
             server::start(addr)?;
         }
         Mode::Client => {

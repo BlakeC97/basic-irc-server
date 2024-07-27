@@ -1,6 +1,12 @@
 use std::io::{BufRead, Read, stdin, stdout, Write};
+use std::sync::Arc;
+use std::thread;
+use std::thread::sleep;
+use std::time::Duration;
 use thiserror::Error;
+use parking_lot::Mutex;
 use crate::response::AuthResponse;
+use crate::scuffed_clone::ScuffedClone;
 use crate::server::VALIDATE_BUFFER_SIZE;
 use crate::server_friendly_string::ServerFriendlyString;
 use crate::user::User;
@@ -16,12 +22,12 @@ pub enum ClientError {
 }
 
 #[derive(Debug)]
-pub struct Client<S: Read + Write> {
+pub struct Client<S: Read + Write + ScuffedClone + Send> {
     user: User,
     conn: S,
 }
 
-impl<S: Read + Write> Client<S>
+impl<S: Read + Write + ScuffedClone + Send> Client<S>
 {
     pub fn new(user: User, conn: S) -> Self {
         Self {
@@ -50,6 +56,38 @@ impl<S: Read + Write> Client<S>
     pub fn start(&mut self) -> Result<(), ClientError> {
         self.do_auth_flow()?;
 
+        // Concurrency is hard so I'll do it stupidly. Yes that's a Mutex for a stream that will
+        // _always_ exclusively hold it. I'm stupid.
+        // TODO: This DOES NOT work as expected. A thread scope will block waiting for the threads to
+        //       return, so it's not suitable for what I'm trying to do. I'll need to be able to use
+        //       a regular `thread::spawn` call, which requires a 'static lifetime on `S`. God help me.
+        //let arc_conn = Arc::new(Mutex::new(self.conn.scuffed_clone()));
+        //thread::scope(|scope| {
+        //    let rx_conn = arc_conn.clone();
+        //    scope.spawn(move || {
+        //        let mut rx_conn = rx_conn.lock();
+        //        let mut buf = Vec::with_capacity(512);
+        //        let mut last_pos = 0;
+        //        loop {
+        //            match rx_conn.read(&mut buf) {
+        //                // lol busy wait
+        //                Ok(0) => { sleep(Duration::from_secs(1)); }
+        //                Ok(n) => {
+        //                    let mut stdout = stdout().lock();
+
+        //                    let _ = stdout.write(&buf[last_pos..last_pos + n]);
+        //                    if let Err(e) = stdout.flush() {
+        //                        eprintln!("Error flushing stdout: {e:?}");
+        //                    };
+
+        //                    last_pos += n;
+        //                }
+        //                Err(e) => { eprintln!("Error on receiving message: {e:?}"); }
+        //            }
+        //        }
+        //    });
+        //});
+
         loop {
             let msg = match get_input(b"> ", stdin().lock(), stdout().lock()) {
                 Ok(m) => {
@@ -76,6 +114,7 @@ impl<S: Read + Write> Client<S>
         Ok(())
     }
 }
+
 
 /// Reads input using a given prompt up to the first newline.
 pub fn get_input<I, O>(prompt: &[u8], mut input: I, mut output: O) -> Result<String, std::io::Error>

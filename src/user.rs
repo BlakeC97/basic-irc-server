@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
@@ -10,5 +11,11 @@ impl User {
         Self {
             name: name.into()
         }
+    }
+}
+
+impl Display for User {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
     }
 }
