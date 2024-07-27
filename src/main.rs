@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Parser;
 use crate::args::{Args, Mode};
 use crate::user::User;
-use crate::server::Server;
 use crate::client::Client;
 
 mod args;
@@ -22,7 +21,7 @@ fn main() -> Result<()> {
         Mode::Server => {
             let listener = TcpListener::bind(addr)?;
             eprintln!("Listening on port {}", listener.local_addr().expect("Can't get local_addr for server").port());
-            Server::new(listener).start()?;
+            server::start(addr)?;
         }
         Mode::Client => {
             let name = args.name.unwrap_or_else(|| {

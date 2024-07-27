@@ -1,7 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 use parking_lot::Mutex;
@@ -10,7 +10,24 @@ use crate::response::AuthResponse;
 use crate::user::User;
 
 pub const VALIDATE_BUFFER_SIZE: usize = 128;
-type SharedSet<T> = Arc<Mutex<BTreeSet<T>>>;
+type SharedMap<K, V> = Arc<Mutex<BTreeMap<K, V>>>;
+
+// So I can use TcpStream for real, but an std::io::Cursor in testing
+trait ScuffedClone {
+    fn scuffed_clone(&self) -> Self;
+}
+
+impl ScuffedClone for TcpStream {
+    fn scuffed_clone(&self) -> Self {
+        self.try_clone().expect("Scuffed clone on a TcpStream didn't work, lolrip")
+    }
+}
+
+impl<T: Clone> ScuffedClone for Cursor<T> {
+    fn scuffed_clone(&self) -> Self {
+        self.clone()
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -22,42 +39,26 @@ pub enum ServerError {
     AlreadyConnected(String),
 }
 
-#[derive(Debug)]
-pub struct Server {
-    listener: TcpListener,
-    connected_users: SharedSet<User>,
-}
+pub fn start(address: SocketAddr) -> std::io::Result<()> {
+    let listener = TcpListener::bind(address)?;
+    let connected_users : SharedMap<User, TcpStream> = Default::default();
 
-impl Server {
-    pub fn new(listener: TcpListener) -> Self {
-        Self {
-            listener,
-            connected_users: Default::default(),
-        }
-    }
-
-    pub fn start(&self) -> std::io::Result<()> {
-        thread::scope(|scope| {
-            for stream_res in self.listener.incoming() {
-                match stream_res {
-                    Ok(stream) => {
-                        let users = self.connected_users.clone();
-                        scope.spawn(move || handle_connection(stream, users));
-                    }
-                    Err(e) => { eprintln!("Failed on handling incoming TcpStream: {e:?}"); }
+    thread::scope(|scope| {
+        for stream_res in listener.incoming() {
+            match stream_res {
+                Ok(stream) => {
+                    let users = connected_users.clone();
+                    scope.spawn(move || handle_connection(stream, users));
                 }
+                Err(e) => { eprintln!("Failed on handling incoming stream: {e:?}"); }
             }
-        });
+        }
+    });
 
-        Ok(())
-    }
+    Ok(())
 }
 
-/// There's no real reason the below functions need to be attached to a `Server`
-/// (they're called from different threads, even), plus it helps make them easier to test
-/// because they use generics w/trait bounds. Plus I dunno how to mock a `TcpListener` so lol rip
-
-fn handle_connection<R: Read + Write>(mut stream: R, mut connected_users: SharedSet<User>) {
+fn handle_connection<S: Read + Write + ScuffedClone>(mut stream: S, mut connected_users: SharedMap<User, S>) {
     match do_auth_flow(&mut stream, &mut connected_users) {
         Ok(user) => {
             handle_chat(stream, &user);
@@ -71,7 +72,7 @@ fn handle_connection<R: Read + Write>(mut stream: R, mut connected_users: Shared
 
 /// Performs the authorization flow for a connecting user. In addition to the `Result`, this function
 /// writes an `AuthResponse` to the stream indicating success or failure.
-fn do_auth_flow<S: Read + Write>(stream: &mut S, connected_users: &mut SharedSet<User>) -> Result<User, ServerError> {
+fn do_auth_flow<S: Read + Write + ScuffedClone>(stream: &mut S, connected_users: &mut SharedMap<User, S>) -> Result<User, ServerError> {
     let mut buf = [0; VALIDATE_BUFFER_SIZE];
     let n = stream.read(&mut buf)?;
 
@@ -80,13 +81,13 @@ fn do_auth_flow<S: Read + Write>(stream: &mut S, connected_users: &mut SharedSet
 
     {
         let mut users = connected_users.lock();
-        if users.contains(&user) {
+        if users.contains_key(&user) {
             let name = user.name.clone();
             let resp = AuthResponse::Error(format!("Name is already taken: {name}"));
             stream.write_all(&serde_json::to_vec(&resp)?)?;
             return Err(ServerError::AlreadyConnected(name));
         }
-        users.insert(user.clone());
+        users.insert(user.clone(), stream.scuffed_clone());
     }
 
     stream.write_all(&serde_json::to_vec(&AuthResponse::Success)?)?;
@@ -178,9 +179,9 @@ mod tests {
         };
         let mut cursor = Cursor::new(user_json);
 
-        let mut connected_users: SharedSet<User> = Default::default();
+        let mut connected_users: SharedMap<User, _> = Default::default();
         {
-            connected_users.lock().insert(user.clone());
+            connected_users.lock().insert(user.clone(), cursor.scuffed_clone());
         }
 
         let failure_res = serde_json::to_vec(&AuthResponse::Error("Name is already taken: hello".to_string())).unwrap();
